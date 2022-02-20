@@ -1,200 +1,141 @@
-from time import perf_counter
-from typing import Tuple
+# Author: Robert Guthrie
 
-from PIL import Image
-
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.data
-import torchvision
-import torchvision.transforms as T
-import sklearn.model_selection
-import matplotlib.pyplot as plt
+import torch.optim as optim
+from typing import List, Dict
+
+torch.manual_seed(1)
+
+lstm = nn.LSTM(3, 3)  # Input dim is 3, output dim is 3
+inputs = [torch.randn(1, 3) for _ in range(5)]  # make a sequence of length 5
+
+# initialize the hidden state.
+hidden = (torch.randn(1, 1, 3),
+          torch.randn(1, 1, 3))
+for i in inputs:
+    # Step through the sequence one element at a time.
+    # after each step, hidden contains the hidden state.
+    out, hidden = lstm(i.view(1, 1, -1), hidden)
+
+# alternatively, we can do the entire sequence all at once.
+# the first value returned by LSTM is all of the hidden states throughout
+# the sequence. the second is just the most recent hidden state
+# (compare the last slice of "out" with "hidden" below, they are the same)
+# The reason for this is that:
+# "out" will give you access to all hidden states in the sequence
+# "hidden" will allow you to continue the sequence and backpropagate,
+# by passing it as an argument  to the lstm at a later time
+# Add the extra 2nd dimension
+inputs = torch.cat(inputs).view(len(inputs), 1, -1)
+hidden = (torch.randn(1, 1, 3), torch.randn(1, 1, 3))  # clean out hidden state
+out, hidden = lstm(inputs, hidden)
+print(out)
+print(hidden)
+
+training_data = [
+    # Tags are: DET - determiner; NN - noun; V - verb
+    # For example, the word "The" is a determiner
+    ("The dog ate the apple".split(), ["DET", "NN", "V", "DET", "NN"]),
+    ("Everybody read that book".split(), ["NN", "V", "DET", "NN"])
+]
+
+# TODO: words cannot directly be used as input to a model. Map each unique word in the
+# training datato a unique index. Use `word_to_ix` for this purpose.
+word_to_ix = {}
+tag_to_ix = {"DET": 0, "NN": 1, "V": 2}  # Assign each tag with a unique index
+for row in training_data:
+    for i in range(len(row[0])):
+        word_to_ix[row[0][i]] = tag_to_ix.get(row[1][i])
+print(word_to_ix)
 
 
-# Define a model
-class FeedForwardNet(nn.Module):
-    def __init__(
-            self,
-            hidden_dim,
-            out_dim=10,
-            img_shape=(28, 28),
-            n_layers: int = 3,
-            p: float = 0.5,
-    ) -> None:
-        super().__init__()
-        in_dim = img_shape[0] * img_shape[1]
-        self.img_shape = img_shape
-        self.layers = nn.ModuleList()
-
-        self.layers.append(nn.Sequential(nn.Linear(in_dim, hidden_dim), nn.ReLU()))
-        for _ in range(n_layers - 2):
-            lin = nn.Linear(hidden_dim, hidden_dim)
-            nn.init.xavier_uniform_(lin.weight)
-            self.layers.append(
-                nn.Sequential(
-                    lin, nn.ReLU(), nn.Dropout(p=p)
-                )
-            )
-        self.layers.append(nn.Linear(hidden_dim, out_dim))
-
-    def forward(self, x):
-        """x has shape (batch_size, *img_size)"""
-        x = torch.flatten(x, start_dim=1)
-        for layer in self.layers:
-            x = layer(x)
-        return x
+# TODO: implement a function that converts a list of strings into a tensor of integers (type
+# long) given some dictionary that maps strings to integers
+def prepare_sequence(seq: List[str], to_ix: Dict[str, int]):
+    return torch.tensor([to_ix.get(elem) for elem in seq], dtype=torch.long)
 
 
-class ConvNet(nn.Module):
-    def __init__(
-            self,
-            hidden_dim,
-            out_dim=10,
-            img_shape=(28, 28),
-            p: float = 0.5,
-            n_channels=1
-    ) -> None:
-        super().__init__()
-        self.img_shape = img_shape
-        self.layers = nn.ModuleList()
-        filters_size = [n_channels, 20, 50]
-        for i in range(1, len(filters_size)):
-            self.layers.append(
-                nn.Sequential(
-                    nn.Conv2d(kernel_size=(5, 5), in_channels=filters_size[i - 1], out_channels=filters_size[i]),
-                    nn.ReLU(),
-                    nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2))
-                )
-            )
-        self.layers.append(nn.Sequential(
-            nn.Linear(filters_size[len(filters_size) - 1] * 4 * 4, hidden_dim),
-            nn.ReLU()
-        ))
-        self.layers.append(nn.Linear(hidden_dim, out_dim))
+val = training_data[0][0]
 
-    def forward(self, x):
-        #x = torch.flatten(x, start_dim=1)
-        i = 1
-        for layer in self.layers:
-            if i == len(self.layers) - 1:
-                x = torch.flatten(x, start_dim=1)
-            x = layer(x)
-            i += 1
-        return x
+# These will usually be more like 32 or 64 dimensional.
+# We will keep them small, so we can see how the weights change as we train.
+EMBEDDING_DIM = 6
+HIDDEN_DIM = 6
 
 
-def train_epoch(
-        model: torch.nn.Module,
-        loader: torch.utils.data.DataLoader,
-        criterion: torch.nn.Module,
-        optimizer: torch.optim.Optimizer,
-        l1_coeff: float = 0
-) -> float:
-    """Train a model for one epoch
+class LSTMTagger(nn.Module):
 
-    Args:
-        model (torch.nn.Module): model to be trained
-        loader (torch.utils.data.DataLoader): Dataloader for training data
-        criterion (torch.nn.Module): loss function
-        optimizer (torch.optim.Optimizer): optimizer
-        l1_coeff (float): coefficient of L1 loss
+    def __init__(self, embedding_dim, hidden_dim, vocab_size, tagset_size):
+        """
+        Args:
+            embedding_dim ([type]): number of dimensions of word embeddings
+            hidden_dim ([type]): number of dimensions of hidden state
+            vocab_size ([type]): number of unique words
+            tagset_size ([type]): number of unique tags (outputs)
+        """
+        super(LSTMTagger, self).__init__()
+        self.hidden_dim = hidden_dim
 
-    Returns:
-        float: total loss over one epoch
-    """
-    total_loss = 0
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)  # I am using device as a global variable, but you could pass it as well
-        out = model(x)
-        if l1_coeff != 0:
-            params = torch.concat([params.view(-1) for params in model.parameters()])
-            l1_loss = F.l1_loss(params, torch.zeros_like(params))
-            loss = criterion(out, y) + l1_coeff * l1_loss
-        else:
-            loss = criterion(out, y)
-        total_loss += loss.item()
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-    return total_loss
+        self.word_embeddings = nn.Embedding(vocab_size, embedding_dim)
 
+        # TODO
+        # The LSTM takes word embeddings as inputs, and outputs hidden states
+        # with dimensionality hidden_dim.
+        self.lstm = nn.LSTM(self.word_embeddings.embedding_dim, hidden_dim)
 
-@torch.no_grad()  # we dont want these operations to be recorded for automatic differentation, saves memory
-def validate(
-        model: torch.nn.Module,
-        loader: torch.utils.data.DataLoader,
-        criterion: torch.nn.Module = None,
-) -> Tuple[float, float]:
-    """Compute total loss and accuracy
+        # TODO
+        # The linear layer that maps from hidden state space to tag space
+        self.lin1 = nn.Linear(hidden_dim, tagset_size)
 
-    Args:
-        model (torch.nn.Module): model to be evaluated
-        loader (torch.utils.data.DataLoader): Dataloader for evaluation data
-        criterion (torch.nn.Module, optional): loss function. Defaults to None.
-
-    Returns:
-        Tuple[float, float]: total loss, accuracy
-    """
-    total_loss = 0
-    total_correct = 0
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        out = model(x)
-        if criterion is not None:
-            loss = criterion(out, y)
-            total_loss += loss.item()
-        total_correct += (out.argmax(dim=1) == y).sum().item()
-    return total_loss, total_correct / len(loader.dataset)
+    def forward(self, sentence):
+        embeds = self.word_embeddings(sentence)
+        # TODO: add the forward pass taking into account the shape that inputs to an LSTM must have (see the start of the notebook)
+        # The final output should have shape (len_of_sentence, tagset_size).
+        # Depending on the loss function you want to use, you may have to normalize the output
+        lstm_out, _ = self.lstm(embeds.view(len(sentence), 1, -1))
+        tag_scores = self.lin1(lstm_out.view(len(sentence), -1))
+        tag_scores = F.log_softmax(tag_scores, dim=1)
+        return tag_scores
 
 
-torch.manual_seed(0)
-
-# load data
-
-train_transforms = torchvision.transforms.ToTensor()  # you can try out torchvision.transforms for augmentation as well
-
-train_set_full = torchvision.datasets.FashionMNIST(
-    "./data", train=True, download=True, transform=train_transforms
-)
-test_set = torchvision.datasets.FashionMNIST(
-    "./data", train=False, download=True, transform=torchvision.transforms.ToTensor()
-)
-
-img, target = train_set_full[231]
-plt.imshow(img.view(28, 28), cmap="binary")
-
-val_size = 0.2
-train_indices, val_indices = sklearn.model_selection.train_test_split(
-    range(len(train_set_full)),
-    stratify=train_set_full.targets,
-    test_size=val_size,
-    random_state=0,
-)
-train_set = torch.utils.data.Subset(train_set_full, train_indices)
-val_set = torch.utils.data.Subset(train_set_full, val_indices)
-
-train_loader = torch.utils.data.DataLoader(train_set, batch_size=500, shuffle=True, num_workers=2)
-val_loader = torch.utils.data.DataLoader(val_set, batch_size=500, shuffle=False, num_workers=2)
-test_loader = torch.utils.data.DataLoader(test_set, batch_size=500, shuffle=False)
-
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
+model = LSTMTagger(EMBEDDING_DIM, HIDDEN_DIM, len(word_to_ix), len(tag_to_ix))
 learning_rate = 1e-3
+optim = torch.optim.Adam(model.parameters(), lr=learning_rate)
+critertion = nn.NLLLoss()
 
-model = ConvNet(hidden_dim=500, out_dim=10, n_channels=1)
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-criterion = nn.CrossEntropyLoss()
+# See what the scores are before training
+# Note that element i,j of the output is the score for tag j for word i.
+# Here we don't need to train, so the code is wrapped in torch.no_grad()
+with torch.no_grad():
+    inputs = prepare_sequence(training_data[0][0], word_to_ix)
+    tag_scores = model(inputs)
+    print(tag_scores)
 
-n_epochs = 10  # change this as needed
-start = perf_counter()
-print("TRAINING:")
-for epoch in range(n_epochs):
-    train_epoch(model, train_loader, criterion, optimizer, l1_coeff=0)
-    train_loss, train_acc = validate(model, train_loader, criterion=criterion)
-    val_loss, val_acc = validate(model, val_loader, criterion=criterion)
-    print(
-        f"{perf_counter() - start:.1f}s {epoch=}: {train_loss=:.3f}, {train_acc=:.3f}, {val_loss=:.3f}, {val_acc=:.3f}"
-    )
+
+# TODO: train your model for 300 epochs
+for epoch in range(300):
+    print("Epoch 1")
+    for sentence, tags in training_data:
+        model.zero_grad()
+        sentence_in = prepare_sequence(sentence, word_to_ix)
+        targets = prepare_sequence(tags, tag_to_ix)
+        tag_scores = model(sentence_in)
+        loss = critertion(tag_scores, targets)
+        loss.backward()
+        optim.step()
+
+
+# See what the scores are after training
+# If your implementation is correct, the model should be able to give the correct tags.
+with torch.no_grad():
+    inputs = prepare_sequence(training_data[0][0], word_to_ix)
+    tag_scores = model(inputs)
+    # The sentence is "the dog ate the apple".  i,j corresponds to score for tag j
+    # for word i. The predicted tag is the maximum scoring tag.
+    # Here, we can see the predicted sequence below is 0 1 2 0 1
+    # since 0 is index of the maximum value of row 1,
+    # 1 is the index of maximum value of row 2, etc.
+    # Which is DET NOUN VERB DET NOUN, the correct sequence!
+    print(tag_scores)
